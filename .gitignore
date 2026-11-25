@@ -1,0 +1,6 @@
+# the plugin built on first use (clay native bricks)
+build/
+.DS_Store
+
+# bricks installed by `clay bricks install`
+bricks/

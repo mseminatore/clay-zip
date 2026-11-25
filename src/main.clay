@@ -1,0 +1,289 @@
+// zip -- zip archives and zlib/deflate/gzip compression (miniz underneath)
+//
+// Usage:
+//   import("zip")
+//
+//   // ---- compression: Strings in, Strings out ----
+//   packed = Zlib compress(text)          // zlib format (RFC 1950); level 0..10, 6
+//   Zlib decompress(packed)               // and back
+//   Zlib deflate(data, 9) / inflate(d)    // raw deflate (RFC 1951)
+//   Zlib gzip(data) / gunzip(d)           // gzip (RFC 1952), as in .gz files
+//   Zlib crc32(data), Zlib adler32(data)  // checksums; pass the last one to continue
+//   Zlib gunzip(d, 1000000)               // raises ZipError past 1000000 bytes
+//
+//   // ---- reading an archive: a file, or its bytes ----
+//   z = Zip open("site.zip")              // or Zip fromBytes(File read("site.zip"))
+//   z names                               // ["index.html", "css/", "css/site.css"]
+//   z entries                             // Dicts: name, size, compressedSize, isDir,
+//                                         //   modified, crc32, encrypted, comment, index
+//   z read("index.html")                  // an entry's contents, as a String
+//   z extract("index.html", "out/i.html") // one entry to a file
+//   z extractAll("out")                   // everything, under out/
+//   z close
+//
+//   // ---- writing an archive: a file, or bytes ----
+//   z = Zip create("site.zip")            // or Zip create, to build it in memory
+//   z add("hello.txt", "Hello!")          // an entry from a String; level 0..10, 6
+//   z addFile("logo.png", "img/logo.png") // a file on disk, as an entry name
+//   z addDir("public", "site/")           // a directory tree, under site/
+//   z close                               // finishes it: returns the path, or the bytes
+//
+//   // with a block, the archive is closed when the block ends, even on error:
+//   Zip open("site.zip") { |z| z read("index.html") }       // the block's value
+//   bytes = Zip create { |z| z add("a.txt", "a") }           // close's value
+//
+// Data is bytes: Clay Strings may hold any bytes, and File read/write are
+// binary-safe. Entry names use "/" between directories, and a name ending in
+// "/" is a directory. Failures raise ZipError (corrupt data, a missing entry,
+// an unsafe path); bad arguments raise TypeError or ArgumentError.
+//
+// How it fits together: `ZipCore` is the prototype the C plugin registers
+// (native/zip.c). `Zip` is a clone of it, so every archive has its C methods;
+// `Zlib` calls its stateless ones. The methods named with a leading `_` are
+// internal.
+
+Zlib = Object clone {
+    compress(data, level = 6)   { ZipCore _compress(data, level, 0) }
+    decompress(data, max = nil) { ZipCore _decompress(data, 0, max ?? 0) }
+
+    deflate(data, level = 6)    { ZipCore _compress(data, level, 1) }
+    inflate(data, max = nil)    { ZipCore _decompress(data, 1, max ?? 0) }
+
+    gzip(data, level = 6)       { ZipCore _compress(data, level, 2) }
+    gunzip(data, max = nil)     { ZipCore _decompress(data, 2, max ?? 0) }
+
+    crc32(data, crc = 0)        { ZipCore _crc32(data, crc) }
+    adler32(data, adler = 1)    { ZipCore _adler32(data, adler) }
+}
+
+Zip = ZipCore clone {
+    // (no parameter is named `path`: clay --compile code assigning to it in a
+    // block would set this slot instead)
+    path = nil          // the file, for an archive opened or created from one
+    _result = nil       // what close returned, for an archive that was written
+
+    // ---- making archives (sent to Zip itself) ------------------------------
+
+    open(file, block = nil)    { _with(self _blank _openFile(file) _at(file), block) }
+    fromBytes(data, block = nil) { _with(self _blank _openBytes(data), block) }
+
+    // Zip create(path) writes a file; Zip create (no path) builds the archive
+    // in memory, and close returns its bytes
+    create(file = nil, block = nil) {
+        (file type == "Block") ifTrue { block = file; file = nil }
+        z = (file == nil) ifTrue { self _blank _createBytes } ifFalse { self _blank _createFile(file) _at(file) }
+        _with(z, block)
+    }
+
+    // ---- reading -----------------------------------------------------------
+
+    // count: the number of entries (in C)
+
+    entries() {
+        all = []
+        self count times { |i| all push(self _entry(i)) }
+        all
+    }
+
+    names() {
+        all = []
+        self count times { |i| all push(self _entry(i) get("name")) }
+        all
+    }
+
+    has(name) { (self _find(name)) >= 0 }
+
+    // the entry's Dict (see entries), or nil if there is none called name
+    entry(name) {
+        i = self _find(name)
+        (i < 0) ifTrue { return nil }
+        self _entry(i)
+    }
+
+    // an entry's contents as a String; name may also be an index
+    read(name) { self _read(self _indexOf(name)) }
+
+    // writes an entry to a file (making its directory); returns the file
+    extract(name, file) {
+        i = self _indexOf(name)
+        (self _entry(i) get("isDir")) ifTrue { ZipCore _raise("Zip: " + name toString + " is a directory", "ArgumentError") }
+        _mkdirs(_parentOf(file))
+        self _extract(i, file)
+    }
+
+    // writes every entry under dir, keeping the archive's directories, and
+    // returns the paths of the files written. Every name is checked first: an
+    // absolute name or one with ".." raises ZipError before anything is written.
+    extractAll(dir) {
+        n = self count
+        names = []
+        n times { |i|
+            e = self _entry(i)
+            names push(_safeName(e get("name"), "ZipError"))
+        }
+        _mkdirs(dir)
+        written = []
+        n times { |i|
+            rel = names at(i)
+            (rel == "") ifFalse {
+                target = Zip _join(dir, rel)
+                (self _entry(i) get("isDir")) ifTrue {
+                    _mkdirs(target)
+                } ifFalse {
+                    _mkdirs(_parentOf(target))
+                    self _extract(i, target)
+                    written push(target)
+                }
+            }
+        }
+        written
+    }
+
+    // ---- writing -----------------------------------------------------------
+
+    // adds an entry holding data (a String); returns the archive, so adds chain
+    add(name, data, level = 6) {
+        self _add(_checkName(name), data, level)
+    }
+
+    // adds the file at path, as name (by default the file's own name)
+    addFile(file, name = nil, level = 6) {
+        n = name ?? _baseOf(file)
+        self _addFile(_checkName(n), file, level)
+    }
+
+    // adds everything under dir, recursively, with names starting with prefix
+    // ("" puts dir's contents at the top of the archive)
+    addDir(dir, prefix = "", level = 6) {
+        (File isDir(dir)) ifFalse { ZipCore _raise("Zip: not a directory: " + dir toString, "ArgumentError") }
+        p = prefix ?? ""
+        ((p != "") && (p endsWith("/") not)) ifTrue { p = p + "/" }
+        (p != "") ifTrue { self _add(_checkName(p), "", 0) }
+        _addTree(dir, p, level)
+        self
+    }
+
+    // finishes an archive being written and closes it: returns its path, or
+    // its bytes if it was built in memory. Closes an archive being read
+    // (returns nil). Closing again is harmless and returns the same.
+    close() {
+        (self _mode == "writing") ifTrue {
+            b = self _finish
+            self _result = (self _inMemory) ifTrue { b } ifFalse { self path }
+            return self _result
+        }
+        self _close
+        self _result
+    }
+
+    // the bytes of an archive built in memory (closing it first)
+    bytes() {
+        (self _inMemory) ifFalse { ZipCore _raise("Zip: bytes is for an archive built in memory (Zip create, with no path)", "ArgumentError") }
+        self close
+    }
+
+    toString() {
+        (self == Zip) ifTrue { return "Zip" }
+        m = self _mode
+        (m == "reading") ifTrue { return "Zip(" + self count toString + " entries)" }
+        (m == "writing") ifTrue { return "Zip(writing)" }
+        "Zip(closed)"
+    }
+
+    // ---- internal ----------------------------------------------------------
+
+    _at(p) { self path = p; self }
+
+    // a new Zip for a constructor to open. Constructors are sent to Zip itself:
+    // sent to an archive they would make a new one and leave it as it was.
+    _blank() {
+        (self == Zip) ifFalse {
+            ZipCore _raise("Zip: make archives with Zip open, Zip fromBytes or Zip create", "ArgumentError")
+        }
+        Zip _new
+    }
+
+    // with a block: run it on z, then close z, even if the block fails
+    _with(z, block) {
+        (block == nil) ifTrue { return z }
+        writing = (z _mode == "writing")
+        r = try { block(z) } finally { z close }
+        writing ifTrue { z close } ifFalse { r }
+    }
+
+    // an entry's index from a name or an index
+    _indexOf(name) {
+        (name type == "Number") ifTrue { return name }
+        i = self _find(name)
+        (i < 0) ifTrue { ZipCore _raise("Zip: no entry named " + name toString, "ZipError") }
+        i
+    }
+
+    _addTree(dir, prefix, level) {
+        (File listDir(dir)) each { |name|
+            p = Zip _join(dir, name)
+            (File isDir(p)) ifTrue {
+                self _add(_checkName(prefix + name + "/"), "", 0)
+                _addTree(p, prefix + name + "/", level)
+            } ifFalse {
+                self _addFile(_checkName(prefix + name), p, level)
+            }
+        }
+    }
+
+    // a name for a new entry: relative, with no ".." (ArgumentError otherwise)
+    _checkName(name) {
+        _safeName(name, "ArgumentError")
+        name
+    }
+
+    // name made relative and tidy ("a//./b" -> "a/b", "a/" stays a directory);
+    // raises errType for a name that would point outside: absolute ("/x",
+    // "C:x", "\\x") or with a ".." part
+    _safeName(name, errType) {
+        (name type == "String") ifFalse { ZipCore _raise("Zip: an entry name must be a String", "TypeError") }
+        n = name replace("\\", "/")
+        bad = (n == "") || (n startsWith("/")) || (n test("^[A-Za-z]:"))
+        parts = []
+        (n split("/")) each { |part|
+            (part == "..") ifTrue { bad = true }
+            ((part != "") && (part != ".")) ifTrue { parts push(part) }
+        }
+        bad ifTrue { ZipCore _raise("Zip: unsafe entry name: " + name, errType) }
+        clean = parts join("/")
+        ((n endsWith("/")) && (clean != "")) ifTrue { clean = clean + "/" }
+        clean
+    }
+
+    _join(dir, name) {
+        (dir == "" || dir == ".") ifTrue { return name }
+        ((dir endsWith("/")) || (dir endsWith("\\"))) ifTrue { return dir + name }
+        dir + "/" + name
+    }
+
+    _baseOf(file) {
+        p = file replace("\\", "/")
+        (p endsWith("/")) ifTrue { p = p slice(0, p length - 1) }
+        i = p lastIndexOf("/")
+        (i < 0) ifTrue { return p }
+        p slice(i + 1, p length)
+    }
+
+    _parentOf(file) {
+        p = file replace("\\", "/")
+        (p endsWith("/")) ifTrue { p = p slice(0, p length - 1) }
+        i = p lastIndexOf("/")
+        (i < 0) ifTrue { return "" }
+        (i == 0) ifTrue { return "/" }
+        p slice(0, i)
+    }
+
+    // makes dir and any missing parents
+    _mkdirs(dir) {
+        (dir == "" || dir == "." || dir == "/") ifTrue { return nil }
+        (File isDir(dir)) ifTrue { return nil }
+        _mkdirs(_parentOf(dir))
+        File mkdir(dir)
+        nil
+    }
+}

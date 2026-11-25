@@ -1,0 +1,20 @@
+{
+  "name": "zip",
+  "version": "0.1.0",
+  "clay": ">=0.3.12",
+  "description": "Zip archives (read and write, in files or memory) and zlib/deflate/gzip compression, built on miniz",
+  "main": "src/main.clay",
+  "deps": {},
+  "native": {
+    "plugin": "zip",
+    "sources": [
+      "native/zip.c",
+      "native/miniz/miniz.c"
+    ],
+    "cflags": [
+      "-I@/native/miniz",
+      "-DMINIZ_NO_ZLIB_COMPATIBLE_NAMES"
+    ],
+    "libs": []
+  }
+}

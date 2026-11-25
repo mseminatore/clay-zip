@@ -1,0 +1,377 @@
+// Tests for the zip brick. Run them from the brick's directory:
+//   clay tests/test_zip.clay
+// The first run builds the C plugin (into build/, which is not committed); a
+// brick can be imported by its own name from inside its own directory.
+// Files are written only under a temporary directory, removed at the end.
+//
+// The base64 fixtures were made by other implementations (Python's zlib,
+// gzip and zipfile modules), so reading them checks interoperability.
+import("zip")
+import("stdlib/test")
+import("stdlib/base64")
+import("stdlib/fs")
+
+fox = "The quick brown fox jumps over the lazy dog. " repeat(20)
+allBytes = String fromBytes((0..255) map { |b| b })
+
+// zlib.compress(fox, 9)
+pyZlib = Base64 decode("eNoLyUhVKCzNTM5WSCrKL89TSMuvUMgqzS0oVsgvSy1SKAFK5yRWVSqk5KfrKYSMKh5VPKqY2ooBR6VDHA==")
+// raw deflate (wbits -15) of fox
+pyRaw = Base64 decode("C8lIVSgszUzOVkgqyi/PU0jLr1DIKs0tKFbIL0stUigBSuckVlUqpOSn6ymEjCoeVTyqmNqKAQ==")
+// gzip of fox, with the file name "fox.txt" in its header
+pyGzip = Base64 decode("H4sICAAAAAAC/2ZveC50eHQAC8lIVSgszUzOVkgqyi/PU0jLr1DIKs0tKFbIL0stUigBSuckVlUqpOSn6ymEjCoeVTyqmNqKAeZKZrCEAwAA")
+// a zip: "docs/" (a directory), "docs/fox.txt" (deflated), "stored.bin" (all 256 bytes, stored)
+pyZip = Base64 decode("UEsDBBQAAAAAAIMYIlAAAAAAAAAAAAAAAAAFAAAAZG9jcy9QSwMEFAAAAAgAgxgiUOZKZrA3AAAAhAMAAAwAAABkb2NzL2ZveC50eHQLyUhVKCzNTM5WSCrKL89TSMuvUMgqzS0oVsgvSy1SKAFK5yRWVSqk5KfrKYSMKh5VPKqY2ooBUEsDBBQAAAAAAIMYIlBzjAUpAAEAAAABAAAKAAAAc3RvcmVkLmJpbgABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp+goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8DBwsPExcbHyMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v9QSwECFAMUAAAAAACDGCJQAAAAAAAAAAAAAAAABQAAAAAAAAAAAAAAgAEAAAAAZG9jcy9QSwECFAMUAAAACACDGCJQ5kpmsDcAAACEAwAADAAAAAAAAAAAAAAAgAEjAAAAZG9jcy9mb3gudHh0UEsBAhQDFAAAAAAAgxgiUHOMBSkAAQAAAAEAAAoAAAAAAAAAAAAAAIABhAAAAHN0b3JlZC5iaW5QSwUGAAAAAAMAAwClAAAArAEAAAAA")
+// a zip with one entry named "../evil.txt"
+pyEvil = Base64 decode("UEsDBBQAAAAAAPq5eF2DFtyMAQAAAAEAAAALAAAALi4vZXZpbC50eHR4UEsBAhQDFAAAAAAA+rl4XYMW3IwBAAAAAQAAAAsAAAAAAAAAAAAAAIABAAAAAC4uL2V2aWwudHh0UEsFBgAAAAABAAEAOQAAACoAAAAAAA==")
+
+tmp = File tempDir + "/clay-zip-test"
+Fs removeTree(tmp)
+Fs mkdirs(tmp)
+
+// ---- Zlib ------------------------------------------------------------------
+
+Test describe("Zlib compress / decompress") {
+    Test it("round-trips text") {
+        Test assertEqual(Zlib decompress(Zlib compress(fox)), fox)
+    }
+    Test it("round-trips every byte value, NULs included") {
+        Test assertEqual(Zlib decompress(Zlib compress(allBytes)), allBytes)
+    }
+    Test it("round-trips the empty string") {
+        Test assertEqual(Zlib decompress(Zlib compress("")), "")
+    }
+    Test it("shrinks repetitive data") {
+        Test assertTrue(Zlib compress(fox) length < (fox length / 10))
+    }
+    Test it("writes a zlib header") {
+        Test assertEqual(Zlib compress(fox) byteAt(0), 120)     // 0x78
+    }
+    Test it("round-trips at every level") {
+        (0..10) each { |level| Test assertEqual(Zlib decompress(Zlib compress(fox, level)), fox) }
+    }
+    Test it("stores at level 0") {
+        Test assertTrue(Zlib compress(fox, 0) length > fox length)
+    }
+    Test it("reads zlib data made by Python") {
+        Test assertEqual(Zlib decompress(pyZlib), fox)
+    }
+    Test it("round-trips a megabyte of random bytes") {
+        data = ""
+        16 times { data = data + Crypto randomBytes(65536) }
+        Test assertEqual(Zlib decompress(Zlib compress(data)), data)
+    }
+    Test it("round-trips several megabytes of compressible data") {
+        data = fox repeat(5000)
+        Test assertEqual(Zlib decompress(Zlib compress(data, 1)), data)
+    }
+}
+
+Test describe("Zlib deflate / inflate (raw)") {
+    Test it("round-trips") {
+        Test assertEqual(Zlib inflate(Zlib deflate(fox)), fox)
+        Test assertEqual(Zlib inflate(Zlib deflate("")), "")
+    }
+    Test it("reads raw deflate made by Python") {
+        Test assertEqual(Zlib inflate(pyRaw), fox)
+    }
+    Test it("has no header: the zlib stream minus its 2-byte header and 4-byte trailer") {
+        z = Zlib compress(fox, 6)
+        Test assertEqual(Zlib deflate(fox, 6), z slice(2, z length - 4))
+    }
+}
+
+Test describe("Zlib gzip / gunzip") {
+    Test it("round-trips") {
+        Test assertEqual(Zlib gunzip(Zlib gzip(fox)), fox)
+        Test assertEqual(Zlib gunzip(Zlib gzip(allBytes, 9)), allBytes)
+        Test assertEqual(Zlib gunzip(Zlib gzip("")), "")
+    }
+    Test it("writes the gzip magic and method") {
+        g = Zlib gzip(fox)
+        Test assertEqual([g byteAt(0), g byteAt(1), g byteAt(2)], [31, 139, 8])
+    }
+    Test it("ends with the CRC-32 and the length") {
+        g = Zlib gzip(fox)
+        n = g length
+        tail = g slice(n - 8, n) bytes
+        crc = tail at(0) + (tail at(1) * 256) + (tail at(2) * 65536) + (tail at(3) * 16777216)
+        size = tail at(4) + (tail at(5) * 256) + (tail at(6) * 65536) + (tail at(7) * 16777216)
+        Test assertEqual([crc, size], [Zlib crc32(fox), fox length])
+    }
+    Test it("reads gzip made by Python, with a file name in the header") {
+        Test assertEqual(Zlib gunzip(pyGzip), fox)
+    }
+    Test it("reads concatenated members as one") {
+        Test assertEqual(Zlib gunzip(Zlib gzip("abc") + Zlib gzip("def")), "abcdef")
+    }
+    Test it("rejects a bad CRC") {
+        g = Zlib gzip(fox)
+        b = g bytes
+        b setAt(g length - 8, (b at(g length - 8) + 1) % 256)
+        Test assertRaises({ Zlib gunzip(String fromBytes(b)) }, "ZipError")
+    }
+    Test it("rejects data that isn't gzip") {
+        Test assertRaises({ Zlib gunzip(Zlib compress(fox)) }, "ZipError")
+    }
+}
+
+Test describe("Zlib errors and limits") {
+    Test it("rejects corrupt data") {
+        Test assertRaises({ Zlib decompress("not compressed at all") }, "ZipError")
+        Test assertRaises({ Zlib inflate(String fromBytes([255, 255, 255, 255])) }, "ZipError")
+    }
+    Test it("rejects truncated data") {
+        c = Zlib compress(fox)
+        Test assertRaises({ Zlib decompress(c slice(0, c length - 6)) }, "ZipError")
+        g = Zlib gzip(fox)
+        Test assertRaises({ Zlib gunzip(g slice(0, g length - 3)) }, "ZipError")
+    }
+    Test it("rejects data after the zlib stream") {
+        Test assertRaises({ Zlib decompress(Zlib compress(fox) + "junk") }, "ZipError")
+    }
+    Test it("stops at max bytes") {
+        c = Zlib compress(fox)
+        Test assertEqual(Zlib decompress(c, fox length), fox)
+        Test assertRaises({ Zlib decompress(c, fox length - 1) }, "ZipError")
+        Test assertRaises({ Zlib gunzip(Zlib gzip(fox), 100) }, "ZipError")
+        Test assertRaises({ Zlib inflate(Zlib deflate(fox), 1) }, "ZipError")
+    }
+    Test it("checks its arguments") {
+        Test assertRaises({ Zlib compress(42) }, "TypeError")
+        Test assertRaises({ Zlib compress(fox, 11) }, "ArgumentError")
+        Test assertRaises({ Zlib compress(fox, -1) }, "ArgumentError")
+        Test assertRaises({ Zlib compress(fox, "best") }, "TypeError")
+        Test assertRaises({ Zlib decompress(nil) }, "TypeError")
+    }
+}
+
+Test describe("Zlib checksums") {
+    Test it("computes CRC-32") {
+        Test assertEqual(Zlib crc32("123456789"), 3421780262)     // 0xCBF43926
+        Test assertEqual(Zlib crc32(""), 0)
+    }
+    Test it("computes Adler-32") {
+        Test assertEqual(Zlib adler32("Wikipedia"), 300286872)    // 0x11E60398
+        Test assertEqual(Zlib adler32(""), 1)
+    }
+    Test it("continues from an earlier checksum") {
+        Test assertEqual(Zlib crc32("6789", Zlib crc32("12345")), Zlib crc32("123456789"))
+        Test assertEqual(Zlib adler32("pedia", Zlib adler32("Wiki")), Zlib adler32("Wikipedia"))
+    }
+}
+
+// ---- Zip: in memory --------------------------------------------------------
+
+Test describe("Zip in memory") {
+    Test it("writes and reads back entries") {
+        w = Zip create
+        w add("a.txt", "alpha") add("dir/b.bin", allBytes, 9) add("c.txt", fox, 0)
+        bytes = w close
+        Test assertEqual(bytes slice(0, 4), "PK" + String fromBytes([3, 4]))
+
+        z = Zip fromBytes(bytes)
+        Test assertEqual(z count, 3)
+        Test assertEqual(z names, ["a.txt", "dir/b.bin", "c.txt"])
+        Test assertEqual(z read("a.txt"), "alpha")
+        Test assertEqual(z read("dir/b.bin"), allBytes)
+        Test assertEqual(z read("c.txt"), fox)
+        Test assertEqual(z read(0), "alpha")
+        z close
+    }
+    Test it("describes entries") {
+        z = Zip fromBytes(Zip create { |w| w add("f.txt", fox) add("d/", "") })
+        e = z entry("f.txt")
+        Test assertEqual(e get("name"), "f.txt")
+        Test assertEqual(e get("size"), fox length)
+        Test assertTrue(e get("compressedSize") < fox length)
+        Test assertEqual(e get("crc32"), Zlib crc32(fox))
+        Test assertFalse(e get("isDir"))
+        Test assertFalse(e get("encrypted"))
+        Test assertEqual(e get("index"), 0)
+        Test assertTrue(e get("modified") > 1500000000)
+        Test assertTrue(z entry("d/") get("isDir"))
+        Test assertEqual(z entries size, 2)
+    }
+    Test it("finds entries by exact name") {
+        z = Zip fromBytes(Zip create { |w| w add("Readme.md", "hi") })
+        Test assertTrue(z has("Readme.md"))
+        Test assertFalse(z has("readme.md"))
+        Test assertEqual(z entry("nope"), nil)
+        Test assertRaises({ z read("nope") }, "ZipError")
+        Test assertRaises({ z read(5) }, "ArgumentError")
+    }
+    Test it("keeps UTF-8 names") {
+        z = Zip fromBytes(Zip create { |w| w add("naïve/café.txt", "ok") })
+        Test assertEqual(z names, ["naïve/café.txt"])
+        Test assertEqual(z read("naïve/café.txt"), "ok")
+    }
+    Test it("makes an empty archive") {
+        z = Zip fromBytes(Zip create { |w| nil })
+        Test assertEqual(z count, 0)
+        Test assertEqual(z names, [])
+    }
+    Test it("returns the bytes again from a second close, and from bytes") {
+        w = Zip create
+        w add("x", "y")
+        b = w bytes
+        Test assertEqual(w close, b)
+        Test assertEqual(w toString, "Zip(closed)")
+    }
+    Test it("returns the block's value from open with a block, and closes") {
+        b = Zip create { |w| w add("x", "42") }
+        kept = nil
+        v = Zip fromBytes(b) { |z| kept = z; z read("x") }
+        Test assertEqual(v, "42")
+        Test assertRaises({ kept read("x") }, "ZipError")
+    }
+    Test it("reads a zip made by Python") {
+        z = Zip fromBytes(pyZip)
+        Test assertEqual(z names, ["docs/", "docs/fox.txt", "stored.bin"])
+        Test assertTrue(z entry("docs/") get("isDir"))
+        Test assertEqual(z read("docs/fox.txt"), fox)
+        Test assertEqual(z read("stored.bin"), allBytes)
+        Test assertEqual(z entry("stored.bin") get("compressedSize"), 256)
+    }
+    Test it("says what it is") {
+        Test assertEqual(Zip toString, "Zip")
+        z = Zip fromBytes(pyZip)
+        Test assertEqual(z toString, "Zip(3 entries)")
+        Test assertEqual(z type, "Zip")
+        Test assertEqual(Zip create toString, "Zip(writing)")
+    }
+}
+
+Test describe("Zip errors") {
+    Test it("rejects data that isn't a zip") {
+        Test assertRaises({ Zip fromBytes("hello") }, "ZipError")
+        Test assertRaises({ Zip fromBytes("") }, "ZipError")
+        Test assertRaises({ Zip fromBytes(42) }, "TypeError")
+    }
+    Test it("rejects a missing file") {
+        Test assertRaises({ Zip open(tmp + "/no-such.zip") }, "ZipError")
+    }
+    Test it("rejects a corrupt entry") {
+        b = (Zip create { |w| w add("f", fox) }) bytes
+        // flip a byte inside the compressed data (after the 30-byte header and the name)
+        b setAt(40, (b at(40) + 1) % 256)
+        z = Zip fromBytes(String fromBytes(b))
+        Test assertRaises({ z read("f") }, "ZipError")
+    }
+    Test it("does not read while writing, or write while reading") {
+        w = Zip create
+        Test assertRaises({ w read("x") }, "ZipError")
+        Test assertRaises({ w names }, "ZipError")
+        z = Zip fromBytes(pyZip)
+        Test assertRaises({ z add("x", "y") }, "ZipError")
+    }
+    Test it("does nothing after close") {
+        z = Zip fromBytes(pyZip)
+        z close
+        Test assertRaises({ z read("stored.bin") }, "ZipError")
+        Test assertEqual(z close, nil)
+        w = Zip create
+        w close
+        Test assertRaises({ w add("x", "y") }, "ZipError")
+    }
+    Test it("refuses unsafe entry names") {
+        w = Zip create
+        Test assertRaises({ w add("../up.txt", "x") }, "ArgumentError")
+        Test assertRaises({ w add("/abs.txt", "x") }, "ArgumentError")
+        Test assertRaises({ w add("C:/win.txt", "x") }, "ArgumentError")
+        Test assertRaises({ w add("a/../../b", "x") }, "ArgumentError")
+        Test assertRaises({ w add("", "x") }, "ArgumentError")
+        Test assertRaises({ w add("a.txt", "x", 42) }, "ArgumentError")
+    }
+    Test it("is made by Zip itself") {
+        z = Zip fromBytes(pyZip)
+        Test assertRaises({ z open("x.zip") }, "ArgumentError")
+    }
+}
+
+// ---- Zip: files ------------------------------------------------------------
+
+Test describe("Zip files") {
+    Test it("writes a file and reads it back") {
+        p = tmp + "/one.zip"
+        Test assertEqual(Zip create(p) { |w| w add("hello.txt", "Hello!") }, p)
+        Test assertTrue(File isFile(p))
+        z = Zip open(p)
+        Test assertEqual(z path, p)
+        Test assertEqual(z read("hello.txt"), "Hello!")
+        z close
+        Test assertEqual(Zip fromBytes(File read(p)) read("hello.txt"), "Hello!")
+    }
+    Test it("finishes an archive dropped without close") {
+        p = tmp + "/dropped.zip"
+        w = Zip create(p)
+        w add("x.txt", "still here")
+        w = nil
+        Test assertEqual(Zip open(p) { |z| z read("x.txt") }, "still here")
+    }
+    Test it("adds files from disk") {
+        src = tmp + "/src.bin"
+        File write(src, allBytes)
+        p = tmp + "/files.zip"
+        Zip create(p) { |w|
+            w addFile(src)
+            w addFile(src, "renamed/copy.bin", 0)
+        }
+        Zip open(p) { |z|
+            Test assertEqual(z names, ["src.bin", "renamed/copy.bin"])
+            Test assertEqual(z read("renamed/copy.bin"), allBytes)
+        }
+    }
+    Test it("adds a directory tree") {
+        d = tmp + "/tree"
+        Fs mkdirs(d + "/sub/deeper")
+        Fs mkdirs(d + "/empty")
+        File write(d + "/top.txt", "top")
+        File write(d + "/sub/mid.txt", "mid")
+        File write(d + "/sub/deeper/low.txt", fox)
+
+        z = Zip fromBytes(Zip create { |w| w addDir(d) })
+        Test assertEqual(z names, ["empty/", "sub/", "sub/deeper/", "sub/deeper/low.txt", "sub/mid.txt", "top.txt"])
+        Test assertEqual(z read("sub/deeper/low.txt"), fox)
+
+        z = Zip fromBytes(Zip create { |w| w addDir(d, "site") })
+        Test assertEqual(z names first, "site/")
+        Test assertTrue(z has("site/sub/mid.txt"))
+        Test assertRaises({ Zip create addDir(tmp + "/nope") }, "ArgumentError")
+    }
+    Test it("extracts one entry, making its directory") {
+        out = tmp + "/one/deep/fox.txt"
+        Zip fromBytes(pyZip) { |z| Test assertEqual(z extract("docs/fox.txt", out), out) }
+        Test assertEqual(File read(out), fox)
+        Test assertRaises({ Zip fromBytes(pyZip) extract("docs/", tmp + "/x") }, "ArgumentError")
+    }
+    Test it("extracts everything") {
+        out = tmp + "/all"
+        written = Zip fromBytes(pyZip) { |z| z extractAll(out) }
+        Test assertEqual(written, [out + "/docs/fox.txt", out + "/stored.bin"])
+        Test assertEqual(File read(out + "/docs/fox.txt"), fox)
+        Test assertEqual(File read(out + "/stored.bin"), allBytes)
+    }
+    Test it("round-trips a tree through a file") {
+        p = tmp + "/tree.zip"
+        Zip create(p) { |w| w addDir(tmp + "/tree") }
+        Zip open(p) { |z| z extractAll(tmp + "/tree2") }
+        Test assertEqual(File read(tmp + "/tree2/sub/deeper/low.txt"), fox)
+        Test assertTrue(File isDir(tmp + "/tree2/empty"))
+    }
+    Test it("refuses to extract outside the directory (zip slip)") {
+        out = tmp + "/slip/inner"
+        Test assertRaises({ Zip fromBytes(pyEvil) extractAll(out) }, "ZipError")
+        Test assertFalse(File exists(tmp + "/slip/evil.txt"))
+        Test assertFalse(File exists(out))
+    }
+}
+
+Test describe("cleanup") {
+    Test it("removes the temporary directory") {
+        Fs removeTree(tmp)
+        Test assertFalse(File exists(tmp))
+    }
+}
+
+Test run
